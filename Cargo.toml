@@ -1,0 +1,20 @@
+[package]
+name = "seatd"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "seatd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seatd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2.179"
+peercred-ipc = { path = "../../lib/peercred-ipc" }
+rmp-serde = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+tokio = { version = "1.49.0", features = ["full"] }
