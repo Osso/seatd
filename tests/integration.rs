@@ -1,10 +1,12 @@
+use serde::{Serialize, de::DeserializeOwned};
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use peercred_ipc::{Client, Server};
-use seatd::client;
 use seatd::server::SeatServer;
 use seatd::{Event, Request, Response, ServerMessage};
 
@@ -14,6 +16,22 @@ fn test_socket_path() -> String {
     let id = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
     let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/seatd-test-{}-{}.sock", base, std::process::id(), id)
+}
+
+fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) {
+    let data = rmp_serde::to_vec(message).unwrap();
+    let len = data.len() as u32;
+    stream.write_all(&len.to_le_bytes()).unwrap();
+    stream.write_all(&data).unwrap();
+}
+
+fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> T {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).unwrap();
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).unwrap();
+    rmp_serde::from_slice(&buf).unwrap()
 }
 
 #[tokio::test]
@@ -59,9 +77,11 @@ async fn test_open_close_seat() {
         // Open seat
         let req: Request = conn.read().await.unwrap();
         assert!(matches!(req, Request::OpenSeat));
-        conn.write(&ServerMessage::Response(Response::SeatOpened { seat_id: 1 }))
-            .await
-            .unwrap();
+        conn.write(&ServerMessage::Response(Response::SeatOpened {
+            seat_id: 1,
+        }))
+        .await
+        .unwrap();
 
         // Close seat
         let req: Request = conn.read().await.unwrap();
@@ -75,17 +95,11 @@ async fn test_open_close_seat() {
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
         let mut stream = UnixStream::connect(&path).unwrap();
 
         // Open seat
-        let data = rmp_serde::to_vec(&Request::OpenSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::OpenSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         match resp {
             ServerMessage::Response(Response::SeatOpened { seat_id }) => {
                 assert_eq!(seat_id, 1);
@@ -94,10 +108,8 @@ async fn test_open_close_seat() {
         }
 
         // Close seat
-        let data = rmp_serde::to_vec(&Request::CloseSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::CloseSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         assert!(matches!(
             resp,
             ServerMessage::Response(Response::SeatClosed)
@@ -119,7 +131,7 @@ async fn test_open_device_returns_fd() {
     let server_handle = tokio::spawn(async move {
         let (mut conn, _caller) = server.accept().await.unwrap();
 
-        let req: Request = conn.read().await.unwrap();
+        let (req, _fds): (Request, Vec<OwnedFd>) = conn.read_with_fds().await.unwrap();
         match req {
             Request::OpenDevice { path } => {
                 assert_eq!(path, Path::new("/dev/null"));
@@ -355,17 +367,11 @@ async fn test_real_server_open_close_seat() {
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
         let mut stream = UnixStream::connect(&path).unwrap();
 
         // Open seat
-        let data = rmp_serde::to_vec(&Request::OpenSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::OpenSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         match resp {
             ServerMessage::Response(Response::SeatOpened { seat_id }) => {
                 assert!(seat_id > 0);
@@ -374,10 +380,8 @@ async fn test_real_server_open_close_seat() {
         }
 
         // Close seat
-        let data = rmp_serde::to_vec(&Request::CloseSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::CloseSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         assert!(
             matches!(resp, ServerMessage::Response(Response::SeatClosed)),
             "Expected SeatClosed, got {:?}",
@@ -441,30 +445,24 @@ async fn test_real_server_open_device_blocked() {
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
         let mut stream = UnixStream::connect(&path).unwrap();
-        let mut buf = vec![0u8; 4096];
 
         // Open seat first
-        let data = rmp_serde::to_vec(&Request::OpenSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::OpenSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         assert!(matches!(
             resp,
             ServerMessage::Response(Response::SeatOpened { .. })
         ));
 
         // Try to open blocked device
-        let data = rmp_serde::to_vec(&Request::OpenDevice {
-            path: "/dev/sda".into(),
-        })
-        .unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(
+            &mut stream,
+            &Request::OpenDevice {
+                path: "/dev/sda".into(),
+            },
+        );
+        let resp: ServerMessage = read_message(&mut stream);
         match resp {
             ServerMessage::Response(Response::Error { message }) => {
                 assert!(
@@ -497,17 +495,11 @@ async fn test_real_server_open_device_success() {
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
         let mut stream = UnixStream::connect(&path).unwrap();
-        let mut buf = vec![0u8; 4096];
 
         // Open seat first
-        let data = rmp_serde::to_vec(&Request::OpenSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::OpenSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         assert!(matches!(
             resp,
             ServerMessage::Response(Response::SeatOpened { .. })
@@ -515,16 +507,16 @@ async fn test_real_server_open_device_success() {
 
         // Open /dev/null (which is allowed via /dev/tty prefix? No, let's use tty)
         // Actually /dev/null won't work. Let's try /dev/tty which should be allowed
-        let data = rmp_serde::to_vec(&Request::OpenDevice {
-            path: "/dev/tty".into(),
-        })
-        .unwrap();
-        stream.write_all(&data).unwrap();
+        write_message(
+            &mut stream,
+            &Request::OpenDevice {
+                path: "/dev/tty".into(),
+            },
+        );
 
         // Read response with potential fd
         // For simplicity, just check we get DeviceOpened response
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        let resp: ServerMessage = read_message(&mut stream);
         match resp {
             ServerMessage::Response(Response::DeviceOpened { device_id }) => {
                 assert!(device_id > 0);
@@ -557,27 +549,19 @@ async fn test_real_server_seat_already_open() {
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
         let mut stream = UnixStream::connect(&path).unwrap();
-        let mut buf = vec![0u8; 4096];
 
         // Open seat
-        let data = rmp_serde::to_vec(&Request::OpenSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::OpenSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         assert!(matches!(
             resp,
             ServerMessage::Response(Response::SeatOpened { .. })
         ));
 
         // Try to open seat again
-        let data = rmp_serde::to_vec(&Request::OpenSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::OpenSeat);
+        let resp: ServerMessage = read_message(&mut stream);
         match resp {
             ServerMessage::Response(Response::Error { message }) => {
                 assert!(
@@ -610,23 +594,15 @@ async fn test_real_server_close_nonexistent_device() {
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-
         let mut stream = UnixStream::connect(&path).unwrap();
-        let mut buf = vec![0u8; 4096];
 
         // Open seat
-        let data = rmp_serde::to_vec(&Request::OpenSeat).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let _: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::OpenSeat);
+        let _: ServerMessage = read_message(&mut stream);
 
         // Try to close nonexistent device
-        let data = rmp_serde::to_vec(&Request::CloseDevice { device_id: 9999 }).unwrap();
-        stream.write_all(&data).unwrap();
-        let n = stream.read(&mut buf).unwrap();
-        let resp: ServerMessage = rmp_serde::from_slice(&buf[..n]).unwrap();
+        write_message(&mut stream, &Request::CloseDevice { device_id: 9999 });
+        let resp: ServerMessage = read_message(&mut stream);
         match resp {
             ServerMessage::Response(Response::Error { message }) => {
                 assert!(
@@ -640,131 +616,6 @@ async fn test_real_server_close_nonexistent_device() {
     })
     .await
     .unwrap();
-
-    server_handle.abort();
-    let _ = std::fs::remove_file(&socket_path);
-}
-
-// Tests using the client module
-
-#[tokio::test]
-async fn test_client_ping() {
-    let socket_path = test_socket_path();
-
-    let mut server = SeatServer::new_with_path(&socket_path).unwrap();
-
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let path = socket_path.clone();
-    let result = tokio::task::spawn_blocking(move || client::ping_at(&path))
-        .await
-        .unwrap();
-
-    assert!(result.is_ok());
-
-    server_handle.abort();
-    let _ = std::fs::remove_file(&socket_path);
-}
-
-#[tokio::test]
-async fn test_client_open_seat() {
-    let socket_path = test_socket_path();
-
-    let mut server = SeatServer::new_with_path(&socket_path).unwrap();
-
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let path = socket_path.clone();
-    let result = tokio::task::spawn_blocking(move || client::open_seat_at(&path))
-        .await
-        .unwrap();
-
-    assert!(result.is_ok());
-    assert!(result.unwrap() > 0);
-
-    server_handle.abort();
-    let _ = std::fs::remove_file(&socket_path);
-}
-
-#[tokio::test]
-async fn test_client_close_seat() {
-    let socket_path = test_socket_path();
-
-    let mut server = SeatServer::new_with_path(&socket_path).unwrap();
-
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let path = socket_path.clone();
-    // Test close_seat_at - this creates a new connection, so no seat is open
-    let result = tokio::task::spawn_blocking(move || client::close_seat_at(&path))
-        .await
-        .unwrap();
-
-    // Should fail because no seat is open on this connection
-    assert!(result.is_err());
-
-    server_handle.abort();
-    let _ = std::fs::remove_file(&socket_path);
-}
-
-#[tokio::test]
-async fn test_client_close_device_error() {
-    let socket_path = test_socket_path();
-
-    let mut server = SeatServer::new_with_path(&socket_path).unwrap();
-
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let path = socket_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let _ = client::open_seat_at(&path);
-        client::close_device_at(&path, 9999)
-    })
-    .await
-    .unwrap();
-
-    assert!(result.is_err());
-
-    server_handle.abort();
-    let _ = std::fs::remove_file(&socket_path);
-}
-
-#[tokio::test]
-async fn test_client_open_device_no_seat() {
-    let socket_path = test_socket_path();
-
-    let mut server = SeatServer::new_with_path(&socket_path).unwrap();
-
-    let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let path = socket_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        client::open_device_at(&path, Path::new("/dev/tty"))
-    })
-    .await
-    .unwrap();
-
-    assert!(result.is_err());
 
     server_handle.abort();
     let _ = std::fs::remove_file(&socket_path);

@@ -189,13 +189,7 @@ impl Vt {
 
     /// Restore original keyboard mode
     pub fn restore_keyboard(&self) -> std::io::Result<()> {
-        let ret =
-            unsafe { libc::ioctl(self.fd.as_raw_fd(), KDSKBMODE, self.original_kb_mode) };
-        if ret < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        self.ioctl_int(KDSKBMODE, self.original_kb_mode)
     }
 
     /// Acknowledge VT release (allow switch away)
@@ -220,8 +214,11 @@ impl Vt {
 
     /// Switch to a different VT
     pub fn switch_to(&self, vt_num: u32) -> std::io::Result<()> {
-        let ret =
-            unsafe { libc::ioctl(self.fd.as_raw_fd(), VT_ACTIVATE, vt_num as libc::c_int) };
+        self.ioctl_int(VT_ACTIVATE, vt_num as libc::c_long)
+    }
+
+    fn ioctl_int(&self, request: libc::c_ulong, value: libc::c_long) -> std::io::Result<()> {
+        let ret = unsafe { libc::ioctl(self.fd.as_raw_fd(), request, value) };
         if ret < 0 {
             Err(std::io::Error::last_os_error())
         } else {

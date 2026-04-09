@@ -1,6 +1,6 @@
 use crate::drm;
 use crate::error::SeatError;
-use crate::protocol::{Event, Request, Response, ServerMessage, SOCKET_PATH};
+use crate::protocol::{Event, Request, Response, SOCKET_PATH, ServerMessage};
 use peercred_ipc::{CallerInfo, Connection, Server};
 use std::collections::HashMap;
 use std::fs::File;
@@ -14,7 +14,6 @@ static SEAT_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 /// Info about an opened device
 struct DeviceInfo {
     fd: OwnedFd,
-    #[allow(dead_code)] // Used for logging/debugging
     path: PathBuf,
     is_drm: bool,
 }
@@ -102,39 +101,51 @@ impl SeatServer {
         match request {
             Request::OpenSeat => {
                 let response = self.open_seat(caller)?;
-                conn.write(&ServerMessage::Response(response)).await?;
+                self.reply(conn, response).await?;
             }
             Request::CloseSeat => {
                 let response = self.close_seat(caller)?;
-                conn.write(&ServerMessage::Response(response)).await?;
+                self.reply(conn, response).await?;
                 return Ok(false);
             }
-            Request::OpenDevice { path } => {
-                let (response, fd) = self.open_device(caller, &path)?;
-                if let Some(fd) = fd {
-                    conn.write_with_fds(&ServerMessage::Response(response), &[fd])
-                        .await?;
-                } else {
-                    conn.write(&ServerMessage::Response(response)).await?;
-                }
-            }
+            Request::OpenDevice { path } => self.reply_open_device(conn, caller, &path).await?,
             Request::CloseDevice { device_id } => {
                 let response = self.close_device(caller, device_id)?;
-                conn.write(&ServerMessage::Response(response)).await?;
+                self.reply(conn, response).await?;
             }
             Request::DisableSeat => {
                 let response = self.disable_seat(caller)?;
-                conn.write(&ServerMessage::Response(response)).await?;
+                self.reply(conn, response).await?;
             }
             Request::SwitchSession { vt } => {
                 let response = self.switch_session(caller, vt)?;
-                conn.write(&ServerMessage::Response(response)).await?;
+                self.reply(conn, response).await?;
             }
-            Request::Ping => {
-                conn.write(&ServerMessage::Response(Response::Pong)).await?;
-            }
+            Request::Ping => self.reply(conn, Response::Pong).await?,
         }
         Ok(true)
+    }
+
+    async fn reply(&self, conn: &mut Connection, response: Response) -> Result<(), SeatError> {
+        conn.write(&ServerMessage::Response(response)).await?;
+        Ok(())
+    }
+
+    async fn reply_open_device(
+        &mut self,
+        conn: &mut Connection,
+        caller: &CallerInfo,
+        path: &Path,
+    ) -> Result<(), SeatError> {
+        let (response, fd) = self.open_device(caller, path)?;
+        if let Some(fd) = fd {
+            conn.write_with_fds(&ServerMessage::Response(response), &[fd])
+                .await?;
+            return Ok(());
+        }
+
+        conn.write(&ServerMessage::Response(response)).await?;
+        Ok(())
     }
 
     fn open_seat(&mut self, caller: &CallerInfo) -> Result<Response, SeatError> {
@@ -218,14 +229,14 @@ impl SeatServer {
             return Err(SeatError::PermissionDenied("not seat owner".into()));
         }
 
-        if session.devices.remove(&device_id).is_none() {
+        let Some(device) = session.devices.remove(&device_id) else {
             return Err(SeatError::DeviceNotFound(format!(
                 "device_id {}",
                 device_id
             )));
-        }
+        };
 
-        println!("Device {} closed", device_id);
+        println!("Device {} closed: {:?}", device_id, device.path);
         Ok(Response::DeviceClosed)
     }
 
@@ -267,43 +278,15 @@ impl SeatServer {
 
     /// Drop DRM master on all DRM devices
     fn drop_drm_master_all(&mut self) {
-        if let Some(session) = &self.session {
-            for (device_id, info) in &session.devices {
-                if info.is_drm {
-                    if let Err(e) = drm::drop_master(info.fd.as_raw_fd()) {
-                        println!(
-                            "Warning: failed to drop DRM master on device {}: {}",
-                            device_id, e
-                        );
-                    } else {
-                        println!("Dropped DRM master on device {}", device_id);
-                    }
-                }
-            }
-        }
+        self.for_each_drm_device(drm::drop_master, "Dropped", "drop");
     }
 
     /// Set DRM master on all DRM devices
-    #[allow(dead_code)] // Used by VT signal handler
     fn set_drm_master_all(&mut self) {
-        if let Some(session) = &self.session {
-            for (device_id, info) in &session.devices {
-                if info.is_drm {
-                    if let Err(e) = drm::set_master(info.fd.as_raw_fd()) {
-                        println!(
-                            "Warning: failed to set DRM master on device {}: {}",
-                            device_id, e
-                        );
-                    } else {
-                        println!("Set DRM master on device {}", device_id);
-                    }
-                }
-            }
-        }
+        self.for_each_drm_device(drm::set_master, "Set", "set");
     }
 
     /// Send disable event to client and mark pending
-    #[allow(dead_code)] // Used by VT signal handler
     pub async fn send_disable(&mut self, conn: &mut Connection) -> Result<(), SeatError> {
         if let Some(session) = &mut self.session {
             session.pending_disable = true;
@@ -314,7 +297,6 @@ impl SeatServer {
     }
 
     /// Send enable event to client and restore DRM master
-    #[allow(dead_code)] // Used by VT signal handler
     pub async fn send_enable(&mut self, conn: &mut Connection) -> Result<(), SeatError> {
         if self.session.is_some() {
             self.set_drm_master_all();
@@ -336,6 +318,36 @@ impl SeatServer {
                 );
                 self.session = None;
             }
+        }
+    }
+
+    fn for_each_drm_device(
+        &self,
+        action: fn(RawFd) -> std::io::Result<()>,
+        success_verb: &str,
+        failure_verb: &str,
+    ) {
+        let Some(session) = &self.session else {
+            return;
+        };
+
+        for (device_id, info) in &session.devices {
+            if !info.is_drm {
+                continue;
+            }
+
+            if let Err(error) = action(info.fd.as_raw_fd()) {
+                println!(
+                    "Warning: failed to {} DRM master on device {} ({:?}): {}",
+                    failure_verb, device_id, info.path, error
+                );
+                continue;
+            }
+
+            println!(
+                "{} DRM master on device {} ({:?})",
+                success_verb, device_id, info.path
+            );
         }
     }
 }

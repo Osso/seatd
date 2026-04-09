@@ -8,4 +8,4 @@ pub mod vt;
 pub use server::SeatServer;
 
 pub use error::SeatError;
-pub use protocol::{Event, Request, Response, ServerMessage, SOCKET_PATH};
+pub use protocol::{Event, Request, Response, SOCKET_PATH, ServerMessage};

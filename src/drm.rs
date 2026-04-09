@@ -5,6 +5,10 @@ use std::os::fd::RawFd;
 const DRM_IOCTL_BASE: u8 = b'd';
 const DRM_IOCTL_SET_MASTER: u8 = 0x1e;
 const DRM_IOCTL_DROP_MASTER: u8 = 0x1f;
+#[cfg(test)]
+const DRM_IOCTL_SET_MASTER_REQUEST: libc::c_ulong = 0x641e;
+#[cfg(test)]
+const DRM_IOCTL_DROP_MASTER_REQUEST: libc::c_ulong = 0x641f;
 
 // ioctl request codes (no arguments, just the command)
 fn drm_io(nr: u8) -> libc::c_ulong {
@@ -55,9 +59,9 @@ mod tests {
     #[test]
     fn test_drm_io_encoding() {
         // Verify the ioctl encoding matches expected values
-        // DRM_IOCTL_SET_MASTER should be 0x641e ('d' << 8 | 0x1e)
-        assert_eq!(drm_io(DRM_IOCTL_SET_MASTER), 0x641e);
-        // DRM_IOCTL_DROP_MASTER should be 0x641f ('d' << 8 | 0x1f)
-        assert_eq!(drm_io(DRM_IOCTL_DROP_MASTER), 0x641f);
+        // DRM_IOCTL_SET_MASTER should be ('d' << 8 | 0x1e)
+        assert_eq!(drm_io(DRM_IOCTL_SET_MASTER), DRM_IOCTL_SET_MASTER_REQUEST);
+        // DRM_IOCTL_DROP_MASTER should be ('d' << 8 | 0x1f)
+        assert_eq!(drm_io(DRM_IOCTL_DROP_MASTER), DRM_IOCTL_DROP_MASTER_REQUEST);
     }
 }

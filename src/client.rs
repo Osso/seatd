@@ -1,5 +1,5 @@
 use crate::error::SeatError;
-use crate::protocol::{Request, Response, ServerMessage, SOCKET_PATH};
+use crate::protocol::{Request, Response, SOCKET_PATH, ServerMessage};
 use peercred_ipc::Client;
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -70,8 +70,7 @@ pub fn close_device(device_id: u32) -> Result<(), SeatError> {
 
 /// Close a device at a custom socket path
 pub fn close_device_at(socket_path: &str, device_id: u32) -> Result<(), SeatError> {
-    let response: ServerMessage =
-        Client::call(socket_path, &Request::CloseDevice { device_id })?;
+    let response: ServerMessage = Client::call(socket_path, &Request::CloseDevice { device_id })?;
     match response {
         ServerMessage::Response(Response::DeviceClosed) => Ok(()),
         ServerMessage::Response(Response::Error { message }) => {
