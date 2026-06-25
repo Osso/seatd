@@ -1,8 +1,11 @@
+pub mod cli;
 pub mod client;
 pub mod drm;
 pub mod error;
 pub mod protocol;
 pub mod server;
+
+#[cfg(not(coverage))]
 pub mod vt;
 
 pub use server::SeatServer;

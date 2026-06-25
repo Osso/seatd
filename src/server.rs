@@ -198,29 +198,8 @@ impl SeatServer {
         let file = File::open(path)
             .map_err(|e| SeatError::DeviceNotFound(format!("{}: {}", path.display(), e)))?;
 
-        let device_id = DEVICE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let raw_fd = file.as_raw_fd();
-        let is_drm = drm::is_drm_device(path);
-
-        // If this is a DRM device and session is enabled, set master
-        if is_drm && session.enabled {
-            if let Err(e) = drm::set_master(raw_fd) {
-                println!("Warning: failed to set DRM master on {:?}: {}", path, e);
-            }
-        }
-
-        let owned_fd: OwnedFd = file.into();
-        session.devices.insert(
-            device_id,
-            DeviceInfo {
-                fd: owned_fd,
-                path: path.to_path_buf(),
-                is_drm,
-            },
-        );
-
-        println!("Device {} opened: {:?} (drm={})", device_id, path, is_drm);
-        Ok((Response::DeviceOpened { device_id }, Some(raw_fd)))
+        let (response, fd) = register_opened_device(session, path, file);
+        Ok((response, Some(fd)))
     }
 
     fn close_device(&mut self, caller: &CallerInfo, device_id: u32) -> Result<Response, SeatError> {
@@ -373,10 +352,80 @@ fn is_allowed_device(path: &Path) -> bool {
     false
 }
 
+fn register_opened_device(session: &mut Session, path: &Path, file: File) -> (Response, RawFd) {
+    let device_id = DEVICE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let raw_fd = file.as_raw_fd();
+    let is_drm = drm::is_drm_device(path);
+
+    if is_drm && session.enabled {
+        if let Err(e) = drm::set_master(raw_fd) {
+            println!("Warning: failed to set DRM master on {:?}: {}", path, e);
+        }
+    }
+
+    let owned_fd: OwnedFd = file.into();
+    session.devices.insert(
+        device_id,
+        DeviceInfo {
+            fd: owned_fd,
+            path: path.to_path_buf(),
+            is_drm,
+        },
+    );
+
+    println!("Device {} opened: {:?} (drm={})", device_id, path, is_drm);
+    (Response::DeviceOpened { device_id }, raw_fd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peercred_ipc::CallerInfo;
+    use std::fs::File;
+    use std::os::fd::OwnedFd;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DRM_ACTION_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn caller(pid: u32) -> CallerInfo {
+        CallerInfo {
+            uid: 1000,
+            gid: 1000,
+            pid,
+            exe: PathBuf::from("/bin/test"),
+        }
+    }
+
+    fn test_socket_path(name: &str) -> String {
+        format!(
+            "{}/seatd-server-unit-{}-{}.sock",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            name
+        )
+    }
+
+    fn test_server(name: &str) -> SeatServer {
+        let path = test_socket_path(name);
+        let _ = std::fs::remove_file(&path);
+        SeatServer::new_with_path(&path).unwrap()
+    }
+
+    fn null_fd() -> OwnedFd {
+        File::open("/dev/null").unwrap().into()
+    }
+
+    fn counted_ok(_fd: RawFd) -> std::io::Result<()> {
+        DRM_ACTION_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn counted_err(_fd: RawFd) -> std::io::Result<()> {
+        DRM_ACTION_CALLS.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
 
     #[test]
     fn test_is_allowed_device_drm() {
@@ -402,5 +451,204 @@ mod tests {
         assert!(!is_allowed_device(Path::new("/dev/null")));
         assert!(!is_allowed_device(Path::new("/etc/passwd")));
         assert!(!is_allowed_device(Path::new("/dev/mem")));
+    }
+
+    #[tokio::test]
+    async fn open_and_close_seat_enforce_single_owner() {
+        let mut server = test_server("seat-owner");
+        let owner = caller(10);
+        let other = caller(11);
+
+        assert!(matches!(
+            server.open_seat(&owner).unwrap(),
+            Response::SeatOpened { .. }
+        ));
+        assert!(matches!(
+            server.open_seat(&owner),
+            Err(SeatError::SeatAlreadyOpen)
+        ));
+        assert!(matches!(
+            server.close_seat(&other),
+            Err(SeatError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            server.close_seat(&owner).unwrap(),
+            Response::SeatClosed
+        ));
+    }
+
+    #[tokio::test]
+    async fn device_requests_require_session_owner_and_allowed_path() {
+        let mut server = test_server("device-owner");
+        let owner = caller(20);
+        let other = caller(21);
+
+        assert!(matches!(
+            server.open_device(&owner, Path::new("/dev/tty")),
+            Err(SeatError::NoSeat)
+        ));
+
+        server.open_seat(&owner).unwrap();
+        assert!(matches!(
+            server.open_device(&other, Path::new("/dev/tty")),
+            Err(SeatError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            server.open_device(&owner, Path::new("/etc/passwd")),
+            Err(SeatError::InvalidDevice(_))
+        ));
+        assert!(matches!(
+            server.close_device(&other, 1),
+            Err(SeatError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            server.close_device(&owner, 999),
+            Err(SeatError::DeviceNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn disable_seat_requires_pending_owner_ack() {
+        let mut server = test_server("disable");
+        let owner = caller(30);
+        let other = caller(31);
+
+        assert!(matches!(
+            server.disable_seat(&owner),
+            Err(SeatError::NoSeat)
+        ));
+        server.open_seat(&owner).unwrap();
+        assert!(matches!(
+            server.disable_seat(&other),
+            Err(SeatError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            server.disable_seat(&owner),
+            Err(SeatError::InvalidDevice(_))
+        ));
+
+        let session = server.session.as_mut().unwrap();
+        session.pending_disable = true;
+
+        assert!(matches!(
+            server.disable_seat(&owner).unwrap(),
+            Response::SeatDisabled
+        ));
+        let session = server.session.as_ref().unwrap();
+        assert!(!session.enabled);
+        assert!(!session.pending_disable);
+    }
+
+    #[tokio::test]
+    async fn switch_session_requires_owner() {
+        let mut server = test_server("switch");
+        let owner = caller(40);
+        let other = caller(41);
+
+        assert!(matches!(
+            server.switch_session(&owner, 2),
+            Err(SeatError::NoSeat)
+        ));
+        server.open_seat(&owner).unwrap();
+        assert!(matches!(
+            server.switch_session(&other, 2),
+            Err(SeatError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            server.switch_session(&owner, 2).unwrap(),
+            Response::SessionSwitched
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_only_removes_matching_caller() {
+        let mut server = test_server("cleanup");
+        let owner = caller(50);
+
+        server.cleanup_session(&owner);
+        server.open_seat(&owner).unwrap();
+        server.cleanup_session(&caller(51));
+        assert!(server.session.is_some());
+        server.cleanup_session(&owner);
+        assert!(server.session.is_none());
+    }
+
+    #[tokio::test]
+    async fn for_each_drm_device_skips_non_drm_and_runs_drm_actions() {
+        let mut server = test_server("drm-actions");
+
+        DRM_ACTION_CALLS.store(0, Ordering::SeqCst);
+        server.for_each_drm_device(counted_ok, "Set", "set");
+        assert_eq!(DRM_ACTION_CALLS.load(Ordering::SeqCst), 0);
+
+        server.open_seat(&caller(60)).unwrap();
+        server.session.as_mut().unwrap().devices.insert(
+            1,
+            DeviceInfo {
+                fd: null_fd(),
+                path: PathBuf::from("/dev/input/event0"),
+                is_drm: false,
+            },
+        );
+        server.for_each_drm_device(counted_ok, "Set", "set");
+        assert_eq!(DRM_ACTION_CALLS.load(Ordering::SeqCst), 0);
+
+        server.session.as_mut().unwrap().devices.insert(
+            2,
+            DeviceInfo {
+                fd: null_fd(),
+                path: PathBuf::from("/dev/dri/card0"),
+                is_drm: true,
+            },
+        );
+
+        server.for_each_drm_device(counted_ok, "Set", "set");
+        assert_eq!(DRM_ACTION_CALLS.load(Ordering::SeqCst), 1);
+
+        server.for_each_drm_device(counted_err, "Set", "set");
+        assert_eq!(DRM_ACTION_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn register_opened_device_tracks_device_and_drm_flag() {
+        let mut server = test_server("register-device");
+        let owner = caller(80);
+
+        server.open_seat(&owner).unwrap();
+        let session = server.session.as_mut().unwrap();
+        let (response, fd) = register_opened_device(
+            session,
+            Path::new("/dev/dri/card0"),
+            File::open("/dev/null").unwrap(),
+        );
+
+        assert!(matches!(response, Response::DeviceOpened { .. }));
+        assert!(fd >= 0);
+        let device = session.devices.values().next().unwrap();
+        assert!(device.is_drm);
+        assert_eq!(device.path, PathBuf::from("/dev/dri/card0"));
+    }
+
+    #[tokio::test]
+    async fn close_device_removes_registered_device() {
+        let mut server = test_server("close-registered-device");
+        let owner = caller(90);
+
+        server.open_seat(&owner).unwrap();
+        let session = server.session.as_mut().unwrap();
+        let (response, _) = register_opened_device(
+            session,
+            Path::new("/dev/input/event0"),
+            File::open("/dev/null").unwrap(),
+        );
+        let Response::DeviceOpened { device_id } = response else {
+            panic!("expected device-opened response");
+        };
+
+        assert!(matches!(
+            server.close_device(&owner, device_id).unwrap(),
+            Response::DeviceClosed
+        ));
+        assert!(server.session.as_ref().unwrap().devices.is_empty());
     }
 }

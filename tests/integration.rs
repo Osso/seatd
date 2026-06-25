@@ -620,3 +620,71 @@ async fn test_real_server_close_nonexistent_device() {
     server_handle.abort();
     let _ = std::fs::remove_file(&socket_path);
 }
+
+#[tokio::test]
+async fn test_real_server_disable_without_pending_returns_error() {
+    let socket_path = test_socket_path();
+
+    let mut server = SeatServer::new_with_path(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut stream = UnixStream::connect(&path).unwrap();
+
+        write_message(&mut stream, &Request::OpenSeat);
+        let _: ServerMessage = read_message(&mut stream);
+
+        write_message(&mut stream, &Request::DisableSeat);
+        let resp: ServerMessage = read_message(&mut stream);
+        match resp {
+            ServerMessage::Response(Response::Error { message }) => {
+                assert!(message.contains("pending disable"), "{message}");
+            }
+            other => panic!("Expected Error response, got {:?}", other),
+        }
+    })
+    .await
+    .unwrap();
+
+    server_handle.abort();
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[tokio::test]
+async fn test_real_server_switch_session() {
+    let socket_path = test_socket_path();
+
+    let mut server = SeatServer::new_with_path(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut stream = UnixStream::connect(&path).unwrap();
+
+        write_message(&mut stream, &Request::OpenSeat);
+        let _: ServerMessage = read_message(&mut stream);
+
+        write_message(&mut stream, &Request::SwitchSession { vt: 2 });
+        let resp: ServerMessage = read_message(&mut stream);
+        assert!(matches!(
+            resp,
+            ServerMessage::Response(Response::SessionSwitched)
+        ));
+    })
+    .await
+    .unwrap();
+
+    server_handle.abort();
+    let _ = std::fs::remove_file(&socket_path);
+}
