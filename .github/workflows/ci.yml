@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout path dependencies
+        run: |
+          mkdir -p ../../lib
+          git clone --depth 1 https://github.com/Osso/peercred-ipc ../../lib/peercred-ipc
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
